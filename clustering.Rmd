@@ -1,0 +1,273 @@
+---
+title: "Time-course RNA-Seq data analysis with Next maSigPro"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+---
+
+* Trial for Next maSigPro
+* Reference : "Next maSigPro: updating maSigPro bioconductor package for RNA-seq time series" (2014,Nueda et al)
+* Dataset : GSE43163 - "Time course RNA-seq analysis of barley powdery mildew fungus Bgh infecting immunocompromised Arabidopsis thaliana" (2013, Maekawa et al)
+
+```{r}
+##### Load packages #####
+
+R.version
+
+library(tidyverse)
+library(edgeR)
+library(maSigPro)
+```
+
+```{bash, engine.opts='-l'}
+##### Get dataset from GEO #####
+
+wget "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE43nnn/GSE43163/suppl/GSE43163_CompleteCountTable_Bgh.txt.gz"
+
+gunzip "./GSE43163_CompleteCountTable_Bgh.txt.gz"
+```
+
+```{r}
+##### Load data #####
+
+df0 <- read.table(file="./GSE43163_CompleteCountTable_Bgh.txt", 
+                  row.names=1, sep="\t", header=T)
+
+count <- as.matrix(df0)
+
+tmp <- colnames(df0)
+
+group <- vector(length = tmp %>% length)
+group[str_which(tmp,"A6")] <- "A6"
+group[str_which(tmp,"K1")] <- "K1"
+```
+
+```{r}
+##### TMM normalization based on edgeR #####
+
+d <- DGEList(counts=count, group=group) 
+
+d <- calcNormFactors(d)
+
+tmm <- cpm(d, log=F)
+```
+
+```{r}
+##### Preprocessing dataframe #####
+
+tmm_tibble <- as.tibble(rownames_to_column(as.data.frame(tmm), "Name"))
+
+df_longer <- pivot_longer(tmm_tibble,!Name)
+
+time_point = c(6,12,18,24)
+
+df_longer["time_point"] <- 0
+df_longer["time_course"] <- 0
+
+df_tpindex <- map_dfr(time_point, 
+             function(x) {
+               tmp <- dplyr::filter(df_longer, str_detect(name, str_c(x, "hpi")))
+               tmp$time_point <- x
+               return(tmp)
+             })
+
+df_tpindex[str_which(df_tpindex$name, "A6"),]$time_course <- 0
+df_tpindex[str_which(df_tpindex$name, "K1"),]$time_course <- 1
+```
+
+```{r, fig.height=6, fig.width=6}
+##### Show expression profile #####
+
+targets = c("bgh04113", "bghG005298000001001", "bgh04997", 
+            "bgh00414", "bgh03734", "bghG004983000003001", 
+            "bgh02188", "bgh00528", "bgh00479",
+            "bgh05485", "bgh01280", "bgh00304")
+
+# targets = c("bgh04113", "bgh00414", "bgh02188", "bgh05485")
+
+
+par(mfrow = c(4,3))
+
+buf <- map(targets, 
+    function(x) {
+      tmp0 <- dplyr::filter(df_tpindex, Name == x & time_course == 0)
+      tmp1 <- dplyr::filter(df_tpindex, Name == x & time_course == 1)
+      
+      maxval <- max(max(tmp0$value), max(tmp1$value))
+      
+      plot(x=tmp0$time_point, y=tmp0$value, 
+           pch=2, 
+           col="red",
+           xlab="time",
+           ylab="expression",
+           main=x,
+           axes=T,
+           xaxt="n",
+           ylim=c(0,maxval))
+      
+      par(new=T); 
+      plot(x=tmp1$time_point, y=tmp1$value, 
+           pch=3, 
+           col="green",
+           axes=F,
+           xlab="",
+           ylab="",
+           main="",
+           ylim=c(0,maxval))
+      
+      axis(1,at=time_point)
+      
+      
+      grouped0 <- group_by(tmp0, time_point)
+      mean0 <- summarise(grouped0, mean=mean(value))$mean
+      
+      par(new=T)
+      plot(x=time_point,y=mean0,
+           type="l",
+           lty=1,
+           col="red",
+           axes=F,
+           xlab="",
+           ylab="",
+           main="",
+           ylim=c(0,maxval))
+      
+      
+      grouped1 <- group_by(tmp1, time_point)
+      mean1 <- summarise(grouped1, mean=mean(value))$mean
+      
+      par(new=T)
+      plot(x=time_point,y=mean1,
+           type="l",
+           lty=2,
+           col="green",
+           axes=F,
+           xlab="",
+           ylab="",
+           main="",
+           ylim=c(0,maxval))
+    })
+
+legend("topleft", legend=c("A6", "K1"), col=c("red","green"), 
+       pch = c(2,3), lty = c(1,2))
+
+```
+
+```{r}
+##### Time-course analysis based on maSigPro #####
+
+count <- as.matrix(tmm)
+
+replicate = c(rep(1,3), rep(2,3), rep(3,3), rep(4,3))
+
+time = c(rep(1,3), rep(2,3), rep(3,3), rep(4,3)) * 6
+
+design <- data.frame(
+    Time       = time,
+    Replicates = replicate,
+    A6 = as.integer(group == "A6"),
+    K1 = as.integer(group == "K1")
+)
+
+rownames(design) <- colnames(count)
+
+d <- make.design.matrix(design, degree = 3)
+```
+
+```{r}
+##### Fitting to GLM model #####
+
+# Step.1
+p <- p.vector(count, d, counts = TRUE)
+
+# Step.2
+t <- T.fit(p)
+```
+
+```{r}
+##### Check fitting results(model coefficient and Goodness-of-fit) #####
+
+res <- get.siggenes(t, vars = "all", rsq=0)
+
+coeff <- res$sig.genes$coefficients[targets,] %>% as.data.frame()
+pval <- res$sig.genes$sig.pvalues[targets,] %>% as.data.frame()
+
+coeff
+pval
+
+
+# pval <- map(targets, 
+#     function(x) {
+#       res$sig.genes$coefficients[x,]
+#       return(res$sig.genes$sig.pvalues[x,])
+#     })
+# 
+# pval
+
+```
+
+```{r, fig.height=6, fig.width=6}
+##### Compare fitting curve and profile #####
+
+par(mfrow = c(4,3))
+
+buf <- map(targets, 
+    function(x) {
+      target <- count[rownames(count) == x, ]
+      
+      PlotGroups(target, edesign = design, show.fit = T,
+           dis = d$dis, groups.vector = d$groups.vector,
+           show.lines = F, 
+           lty.legend = c(2,3), pch = c(rep(1,12), rep(2,12)),
+           main = x)
+    })
+```
+
+```{r, fig.height=8, fig.width=8}
+
+each = get.siggenes(t, vars = "each", rsq=0)
+
+see.genes(each$sig.genes$Time, k = 9)
+
+cl = see.genes(each$sig.genes$Time2, k=9)
+
+cl_1 = names(cl$cut[cl$cut == 1])
+
+
+see.genes(each$sig.genes$Time3, k=9)
+
+```
+
+```{r}
+
+cls = list(rep(0,4))
+
+cls
+
+sum = 0
+
+for (i in 1:4) {
+  sum = sum + i
+  
+  print(i)
+}
+
+cl[cl$cut == 1:4]
+
+
+
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
